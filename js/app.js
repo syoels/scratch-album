@@ -112,7 +112,7 @@ const photoMat = new THREE.ShaderMaterial({
       vec3 c = texture2D(uTex, uv).rgb * uBright;
       float d = length((vUv - 0.5) * vec2(uScreenAspect, 1.0));
       // warm bloom-ish glow from the centre
-      c += uGlow * vec3(1.0, 0.82, 0.65) * 0.35 * (1.0 - smoothstep(0.0, 0.9, d));
+      c += uGlow * vec3(1.0, 0.82, 0.65) * 0.22 * (1.0 - smoothstep(0.0, 0.9, d));
       // gentle vignette
       c *= 1.0 - 0.28 * smoothstep(0.45, 1.1, d);
       gl_FragColor = vec4(c, 1.0);
@@ -290,10 +290,11 @@ const burstMat = new THREE.ShaderMaterial({
     uSpread: { value: 1 },
   },
   vertexShader: /* glsl */ `
-    attribute vec4 aRand;
+    attribute vec4 aRand; attribute vec3 aCol; attribute vec2 aSize;
     uniform float uT, uSize, uSpread; uniform vec2 uCenter;
-    varying float vAlpha; varying float vMix;
+    varying float vAlpha; varying float vMix; varying vec3 vCol; varying float vShard; varying vec2 vRot;
     void main(){
+      vCol = aCol; vShard = aSize.y;
       float t = clamp(uT - aRand.w * 0.12, 0.0, 1.0);    // tiny stagger
       float e = 1.0 - pow(1.0 - t, 3.0);                   // ease-out cubic
       vec2 dir = normalize(position.xy - uCenter + (aRand.xy - 0.5) * 120.0);
@@ -301,23 +302,33 @@ const burstMat = new THREE.ShaderMaterial({
       vec2 p = position.xy + dir * speed * e;
       p += vec2(sin(t * 7.0 + aRand.w * 6.28), cos(t * 6.0 + aRand.x * 6.28)) * 28.0 * t;  // swirl
       p.y += 160.0 * t * t * (aRand.y - 0.25);             // drift
+      p.y -= 520.0 * t * t * aSize.y * uSpread;            // shards fall
       vAlpha = 1.0 - smoothstep(0.35 + 0.45 * aRand.y, 1.0, t);
       vMix = smoothstep(0.0, 0.6, t);
+      float ang = aRand.x * 6.28 + t * (aRand.z - 0.5) * 30.0;
+      vRot = vec2(cos(ang), sin(ang));
       float pop = 1.0 + 1.8 * sin(min(t * 4.0, 1.0) * 3.14159) * aRand.z;
-      gl_PointSize = uSize * pop * (1.0 - 0.55 * t);
+      gl_PointSize = uSize * aSize.x * pop * (1.0 - 0.55 * t);
       gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 0.0, 1.0);
     }
   `,
   fragmentShader: /* glsl */ `
     uniform vec3 uHot, uCool;
-    varying float vAlpha; varying float vMix;
+    varying float vAlpha; varying float vMix; varying vec3 vCol; varying float vShard; varying vec2 vRot;
     void main(){
-      float d = length(gl_PointCoord - 0.5);
+      vec2 q = gl_PointCoord - 0.5;
+      float d = length(q);
       float a = smoothstep(0.5, 0.0, d);
-      gl_FragColor = vec4(mix(uHot, uCool, vMix) * (1.0 + a * 0.4), a * vAlpha);
+      if (vShard > 0.5) {                     // foil shard: crisp tumbling diamond with a glint
+        float r = abs(q.x * vRot.x - q.y * vRot.y) + abs(q.x * vRot.y + q.y * vRot.x);
+        a = 1.0 - smoothstep(0.4, 0.46, r);
+      }
+      vec3 c = mix(vCol, uCool, vMix * (1.0 - vShard) * 0.6);
+      c += vShard * 0.35 * pow(max(vRot.x, 0.0), 8.0);   // flash as it turns
+      gl_FragColor = vec4(c * (1.0 + a * 0.4), a * vAlpha);
     }
   `,
-  transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending,
+  transparent: true, depthTest: false, depthWrite: false, blending: THREE.NormalBlending,
 });
 let burst = null;
 
@@ -332,7 +343,9 @@ function makeBurst() {
   for (let i = 3; i < img.length; i += 4 * 16) if (img[i] > 160) filled++;
   filled *= 16;
   const step = Math.max(2, Math.round(Math.sqrt(filled / 9000)));
-  const pos = [], rnd = [];
+  const pos = [], rnd = [], col = [], siz = [];
+  const textPt = Math.max(2.5, step / DPR * 1.6);
+  // 1) what's left of the message: bright white particles
   for (let y = 0; y < th; y += step) {
     for (let x = 0; x < tw; x += step) {
       const i = (y * tw + x) * 4;
@@ -341,18 +354,37 @@ function makeBurst() {
       if (mask[(my * mw + mx) * 4] > 120) continue;            // already scratched away
       pos.push(x / tw * W, H - y / th * H, 0);
       rnd.push(Math.random(), Math.random(), Math.random(), Math.random());
+      col.push(1, 0.97, 0.9);
+      siz.push(textPt, 0.15);
+    }
+  }
+  // 2) whatever foil is still covering the photo: palette-colored shards
+  let left = 0;
+  for (let i = 0; i < mask.length; i += 4) if (mask[i] < 120) left++;
+  const keep = Math.min(1, 5000 / Math.max(left, 1));
+  const pal = state.palette.map((h) => hex(h));
+  for (let my = 0; my < mh; my++) {
+    for (let mx = 0; mx < mw; mx++) {
+      if (mask[(my * mw + mx) * 4] >= 120 || Math.random() > keep) continue;
+      const c = pal[(Math.random() * 4) | 0].clone().lerp(new THREE.Color(1, 1, 1), 0.15 + Math.random() * 0.35);
+      pos.push((mx + Math.random()) / mw * W, H - (my + Math.random()) / mh * H, 0);
+      rnd.push(Math.random(), Math.random(), Math.random(), Math.random());
+      col.push(c.r, c.g, c.b);
+      siz.push(3 + Math.random() * 5, 1);
     }
   }
   if (!pos.length) return;
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('aRand', new THREE.Float32BufferAttribute(rnd, 4));
+  g.setAttribute('aCol', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('aSize', new THREE.Float32BufferAttribute(siz, 2));
   burst = new THREE.Points(g, burstMat);
   burst.renderOrder = 3;
   burst.frustumCulled = false;
   burstMat.uniforms.uT.value = 0;
   burstMat.uniforms.uCenter.value.set(W / 2, H / 2);
-  burstMat.uniforms.uSize.value = Math.max(2.5, step / DPR * 1.6) * DPR;
+  burstMat.uniforms.uSize.value = DPR;
   burstMat.uniforms.uSpread.value = Math.min(W, H) / 400;
   burstMat.uniforms.uCool.value = hex(state.palette[3]);
   scene.add(burst);
@@ -461,7 +493,7 @@ const state = {
   scratched: 0,
 };
 let nextMessage, nextPhotoName, nextPalette;
-if (location.search.includes('debug')) window.__sa = { state, get msgs() { return nextMessage; } };
+if (location.search.includes('debug')) window.__sa = { state, gsap, get msgs() { return nextMessage; } };
 
 function loadPhoto(name) {
   return new Promise((resolve, reject) => {
@@ -546,7 +578,7 @@ function reveal() {
   tl.add(() => { makeBurst(); u.uTextAlpha.value = 0; });
   tl.to(burstMat.uniforms.uT, { value: 1.12, duration: 1.6, ease: 'none' }, '>');
   // secondary: the remaining foil dissolves with a glowing edge
-  tl.to(u.uDissolve, { value: 1, duration: 1.0, ease: 'power2.inOut' }, '<0.05');
+  tl.to(u.uDissolve, { value: 1, duration: 0.38, ease: 'power2.in' }, '<');
   // the photo "breathes": pop + glow, then settle into a slow drift
   tl.to(pu.uBright, { value: 1, duration: 0.6, ease: 'power2.out' }, '<');
   tl.fromTo(pu.uZoom, { value: 1.0 }, { value: 1.07, duration: 0.42, ease: 'back.out(2.2)' }, '<0.1');
