@@ -1,0 +1,5 @@
+# Full-size originals stay local: they're large and carry EXIF/GPS data.
+# The site uses the stripped web copies in photos/ (made by tools/build_photos.py).
+imgs/
+.DS_Store
+Thumbs.db
